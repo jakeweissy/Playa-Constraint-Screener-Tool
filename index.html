@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playa Constraint Screener</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+ :root{--paper:#f3eee3;--ink:#20241f;--basin:#1d3b2a;--clay:#b4612f;--muted:#6f6657;--line:#d9d0be;--panel:#fbf8f1;}
+ html,body{height:100%;margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:var(--ink);}
+ #map{position:absolute;inset:0;background:var(--paper);}
+ .panel{position:absolute;top:16px;left:16px;z-index:1000;width:312px;max-width:calc(100% - 32px);
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 14px 40px -18px rgba(29,59,42,.55);padding:15px 17px;}
+ .kicker{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--clay);}
+ h1{font-size:19px;margin:4px 0 3px;color:var(--basin);}
+ .sub{font-size:11.5px;color:var(--muted);line-height:1.4;}
+ .up{margin:13px 0 9px;}
+ .up label{display:block;font-size:11px;font-weight:600;color:var(--basin);margin-bottom:6px;}
+ .drop{border:2px dashed var(--line);border-radius:8px;padding:16px 10px;text-align:center;
+  font-size:12px;color:var(--muted);cursor:pointer;transition:.15s;}
+ .drop:hover,.drop.over{border-color:var(--basin);background:#f4f7f3;color:var(--basin);}
+ .row{display:flex;align-items:center;gap:8px;font-size:12px;margin:9px 0;}
+ select{font:inherit;font-size:12px;padding:3px 6px;border:1px solid var(--line);border-radius:5px;}
+ .status{font-size:11.5px;color:var(--muted);min-height:16px;margin-top:6px;}
+ .status.err{color:#c62828;}
+ .lt{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:12px 0 6px;}
+ .lg{display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:5px;}
+ .sw{width:15px;height:15px;border-radius:4px;flex:none;border:1px solid rgba(0,0,0,.15);}
+ .pp-name{font-size:15px;color:var(--basin);font-weight:700;}
+ .pp-score{display:flex;align-items:baseline;gap:6px;margin:6px 0 8px;}
+ .pp-num{font-size:26px;font-weight:700;}
+ .pp-badge{color:#fff;font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;}
+ table.dims{width:100%;border-collapse:collapse;font-size:11.5px;}
+ table.dims td{padding:2px 0;border-bottom:1px solid var(--line);}
+ table.dims td:last-child{text-align:right;font-weight:700;}
+ .ppbtn{margin-top:9px;font:inherit;font-size:11px;font-weight:700;cursor:pointer;color:var(--paper);
+  background:var(--basin);border:none;padding:7px 12px;border-radius:6px;}
+ .note{margin-top:12px;padding-top:10px;border-top:1px dashed var(--line);font-size:10px;color:var(--muted);line-height:1.45;}
+</style></head><body>
+<div id="map"></div>
+<div class="panel">
+ <div class="kicker">Environmental Permitting &middot; GIS</div>
+ <h1>Playa Constraint Screener</h1>
+ <div class="sub">Drop a project boundary on the Texas map to score it and download a PDF report. No code.</div>
+ <div class="up">
+  <label>Upload boundary (GeoJSON, or zipped shapefile &mdash; WGS84)</label>
+  <div id="drop" class="drop">Click to choose, or drag a file here<br><span style="font-size:10.5px">.geojson &middot; .json &middot; .zip</span></div>
+  <input id="file" type="file" accept=".geojson,.json,.zip" style="display:none">
+ </div>
+ <div class="row"><span>WOTUS scenario:</span>
+  <select id="scenario"><option value="conforming">Conforming (conservative)</option>
+  <option value="proposed">Proposed rule</option></select></div>
+ <div id="status" class="status">Loading playa data&hellip;</div>
+ <div class="lt">Constraint rating</div>
+ <div class="lg"><span class="sw" style="background:#2e7d32"></span>Low (0&ndash;25)</div>
+ <div class="lg"><span class="sw" style="background:#e0a106"></span>Moderate (25&ndash;50)</div>
+ <div class="lg"><span class="sw" style="background:#ef6c00"></span>High (50&ndash;75)</div>
+ <div class="lg"><span class="sw" style="background:#c62828"></span>Severe (75&ndash;100)</div>
+ <div class="note">Playa-driven screen (ESG, Hydrology, Migratory, PLJV, plus §404 residual). NWI &amp;
+  critical-habitat refinements remain in the Python tool. Screening only &mdash; not a jurisdictional
+  determination or delineation.</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/shpjs@4.0.4/dist/shp.min.js"></script>
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+<script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="playa_app_data.js"></script>
+<script>
+const CFG = {playaPctCap:10, bufferPctCap:25, clusterPctCap:5, largePlayaHa:4, largePlayaCap:5,
+ bufferM:100, weights:{esg:.25,hydrology:.20,migratory:.20,cwa404:.15,pljv:.20},
+ s404:{conforming:1.0, proposed:0.5}, bands:[[0,25,'Low'],[25,50,'Moderate'],[50,75,'High'],[75,101,'Severe']]};
+const RATING = {Low:'#2e7d32',Moderate:'#e0a106',High:'#ef6c00',Severe:'#c62828'};
+const DIMS = [['esg','1. ESG / Reputation'],['hydrology','2. Hydrology & Drainage'],
+ ['migratory','3. Migratory Bird Exposure'],['cwa404','4. CWA Section 404'],['pljv','5. PLJV Siting Guidance']];
+const ACTIONS = {esg:'Document playa avoidance for ESG reporting.',
+ hydrology:'Keep panels, BESS and roads out of playa basins and buffers.',
+ migratory:'Engage USFWS/IPaC early; reduce Central Flyway impacts.',
+ cwa404:'Request a USACE jurisdictional determination; budget for a delineation.',
+ pljv:'Redesign to avoid large isolated playas and playa clusters.'};
+function cap(v,c){return Math.max(0,Math.min(v/c,1))*100;}
+function setStatus(t,err){var s=document.getElementById('status');s.textContent=t;s.className='status'+(err?' err':'');}
+
+if(typeof L==='undefined'||typeof turf==='undefined'){setStatus('A required library failed to load — check your internet connection.',true);}
+else if(typeof window.PLAYA_DATA==='undefined'){setStatus('playa_app_data.js not found. Run make_browser_data.py first, then put the file next to this page.',true);}
+else {
+ // Pre-compute playa bboxes once for fast filtering.
+ PLAYA_DATA.features.forEach(function(f){f.__bb=turf.bbox(f);});
+ setStatus(PLAYA_DATA.features.length.toLocaleString()+' playas loaded. Upload a boundary to begin.');
+
+ var imagery=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{attribution:'Esri',maxZoom:19});
+ var light=L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',{attribution:'OSM, CARTO',maxZoom:20});
+ var map=L.map('map',{layers:[imagery],preferCanvas:true}).setView([31.3,-99.3],6);
+ L.control.layers({'Satellite':imagery,'Light map':light},{},{position:'topright'}).addTo(map);
+ if(window.TEXAS_BOUNDARY){L.geoJSON(TEXAS_BOUNDARY,{style:{color:'#1d3b2a',weight:2,fill:false,dashArray:'4 3'}}).addTo(map);}
+
+ var RESULTS=[], uploadLayer=null;
+
+ function bboxOverlap(a,b){return !(a[2]<b[0]||a[0]>b[2]||a[3]<b[1]||a[1]>b[3]);}
+
+ function score(boundary, scenario){
+  var bAreaHa=turf.area(boundary)/1e4; if(!(bAreaHa>0)) bAreaHa=0.0001;
+  var pad=0.02, bb=turf.bbox(boundary), qb=[bb[0]-pad,bb[1]-pad,bb[2]+pad,bb[3]+pad];
+  var cand=PLAYA_DATA.features.filter(function(f){return bboxOverlap(f.__bb,qb);});
+  var playaAreaHa=0, clusteredHa=0, count=0, large=0, buffers=[];
+  cand.forEach(function(f){
+   var inter=null; try{inter=turf.intersect(boundary,f);}catch(e){}
+   if(inter){var aHa=turf.area(inter)/1e4; playaAreaHa+=aHa; count++;
+    if(aHa>=CFG.largePlayaHa) large++;
+    if(f.properties&&f.properties.c==1) clusteredHa+=aHa;
+    try{buffers.push(turf.buffer(f,CFG.bufferM,{units:'meters'}));}catch(e){}
+   }});
+  var bufferPct=0;
+  if(buffers.length){try{
+   var u=buffers[0]; for(var i=1;i<buffers.length;i++){var nu=turf.union(u,buffers[i]); if(nu)u=nu;}
+   var av=turf.intersect(boundary,u); if(av) bufferPct=(turf.area(av)/1e4)/bAreaHa*100;
+  }catch(e){}}
+  var playaPct=playaAreaHa/bAreaHa*100, clusterPct=clusteredHa/bAreaHa*100;
+  var ci=cap(clusterPct,CFG.clusterPctCap), present=count>0;
+  var d={};
+  d.esg=Math.max(cap(playaPct,CFG.playaPctCap),ci);
+  d.hydrology=Math.max(cap(playaPct,CFG.playaPctCap),cap(bufferPct,CFG.bufferPctCap));
+  d.migratory=Math.max(ci,cap(playaPct,CFG.playaPctCap)*0.5);
+  d.cwa404=(present?50:0)*(CFG.s404[scenario]||1);
+  d.pljv=Math.max(ci,cap(large,CFG.largePlayaCap),cap(playaPct,CFG.playaPctCap)*0.6);
+  var W=CFG.weights, comp=0,wsum=0; for(var k in W){comp+=d[k]*W[k];wsum+=W[k];} comp=comp/wsum;
+  var rating=CFG.bands.find(function(b){return comp>=b[0]&&comp<b[1];}); rating=rating?rating[2]:'Low';
+  return {composite:Math.round(comp*10)/10, rating:rating, dims:d, scenario:scenario,
+   m:{count:count,playaAreaHa:playaAreaHa,playaPct:playaPct,large:large,bufferPct:bufferPct,
+      clusterIntensity:ci,clusterPct:clusterPct,bAreaHa:bAreaHa}};
+ }
+
+ function popupHtml(name,r,idx){
+  var c=RATING[r.rating];
+  var rows=DIMS.map(function(d){return '<tr><td>'+d[1]+'</td><td>'+r.dims[d[0]].toFixed(0)+'</td></tr>';}).join('');
+  var fl=DIMS.filter(function(d){return r.dims[d[0]]>=50;}).map(function(d){return d[1];}).join('; ');
+  return '<div class="pp-name">'+name+'</div><div class="pp-score"><span class="pp-num" style="color:'+c+'">'
+   +r.composite.toFixed(1)+'</span><span class="pp-badge" style="background:'+c+'">'+r.rating+'</span>'
+   +'<span style="font-size:11px;color:#888">/100</span></div><table class="dims">'+rows+'</table>'
+   +(fl?'<div style="margin-top:6px;font-size:10.5px;color:#b4612f"><b>Flags:</b> '+fl+'</div>':'')
+   +'<button class="ppbtn" onclick="downloadPDF('+idx+')">Download PDF report</button>';
+ }
+
+ function addFeature(feat, name){
+  var scenario=document.getElementById('scenario').value;
+  var r=score(feat,scenario); var idx=RESULTS.length; RESULTS.push({feat:feat,name:name,r:r});
+  var lyr=L.geoJSON(feat,{style:{color:RATING[r.rating],weight:2,fillColor:RATING[r.rating],fillOpacity:.45}});
+  lyr.bindPopup(popupHtml(name,r,idx),{maxWidth:300}); lyr.addTo(uploadLayer);
+  return r;
+ }
+
+ function looksProjected(fc){
+  try{var bb=turf.bbox(fc);return Math.abs(bb[0])>180||Math.abs(bb[1])>90||Math.abs(bb[2])>180||Math.abs(bb[3])>90;}
+  catch(e){return false;}
+ }
+
+ function handle(gj){
+  var fc=gj.type==='FeatureCollection'?gj:(gj.type==='Feature'?{type:'FeatureCollection',features:[gj]}:
+    {type:'FeatureCollection',features:[{type:'Feature',properties:{},geometry:gj}]});
+  if(!fc.features||!fc.features.length){setStatus('No features found in that file.',true);return;}
+  if(looksProjected(fc)){setStatus('Coordinates are not WGS84 (lon/lat). Re-export your boundary in EPSG:4326 and try again.',true);return;}
+  if(uploadLayer){map.removeLayer(uploadLayer);} uploadLayer=L.featureGroup().addTo(map); RESULTS=[];
+  var n=0, nameField=null, props=fc.features[0].properties||{};
+  ['site_name','Name','name','NAME','Project','project','PROJECT'].forEach(function(k){if(nameField===null&&k in props)nameField=k;});
+  fc.features.forEach(function(f,i){
+   if(!f.geometry||(f.geometry.type!=='Polygon'&&f.geometry.type!=='MultiPolygon'))return;
+   var nm=(nameField&&f.properties&&f.properties[nameField])?String(f.properties[nameField]):('Site '+(i+1));
+   addFeature(f,nm); n++;
+  });
+  if(!n){setStatus('No polygon boundaries found (need Polygon/MultiPolygon).',true);return;}
+  try{map.fitBounds(uploadLayer.getBounds().pad(0.3));}catch(e){}
+  setStatus(n+' boundary'+(n>1?'ies':'')+' scored. Click a shape for its report.');
+ }
+
+ function readFile(file){
+  setStatus('Reading '+file.name+' \u2026');
+  if(/\.zip$/i.test(file.name)){
+   file.arrayBuffer().then(function(buf){return shp(buf);}).then(function(gj){handle(gj);})
+    .catch(function(e){setStatus('Could not read that shapefile zip: '+e.message+' (a GeoJSON in WGS84 is the most reliable input).',true);});
+  } else {
+   var rd=new FileReader();
+   rd.onload=function(){var t=rd.result; if(t.charCodeAt(0)===0xFEFF)t=t.slice(1);
+    try{handle(JSON.parse(t));}catch(e){setStatus('That file is not valid GeoJSON: '+e.message,true);}};
+   rd.onerror=function(){setStatus('Could not read the file.',true);}; rd.readAsText(file);
+  }
+ }
+
+ var drop=document.getElementById('drop'), input=document.getElementById('file');
+ drop.onclick=function(){input.click();};
+ input.onchange=function(e){if(e.target.files[0])readFile(e.target.files[0]);};
+ ['dragenter','dragover'].forEach(function(ev){drop.addEventListener(ev,function(e){e.preventDefault();drop.classList.add('over');});});
+ ['dragleave','drop'].forEach(function(ev){drop.addEventListener(ev,function(e){e.preventDefault();drop.classList.remove('over');});});
+ drop.addEventListener('drop',function(e){e.preventDefault();if(e.dataTransfer.files[0])readFile(e.dataTransfer.files[0]);});
+ document.getElementById('scenario').onchange=function(){
+  if(!RESULTS.length)return; var feats=RESULTS.map(function(x){return {feat:x.feat,name:x.name};});
+  if(uploadLayer)map.removeLayer(uploadLayer); uploadLayer=L.featureGroup().addTo(map); RESULTS=[];
+  feats.forEach(function(x){addFeature(x.feat,x.name);});
+  setStatus('Rescored under "'+document.getElementById('scenario').value+'" scenario.');
+ };
+
+ window.downloadPDF=function(idx){
+  var R=RESULTS[idx]; if(!R)return; var r=R.r, m=r.m;
+  var jsPDF=window.jspdf.jsPDF, doc=new jsPDF({unit:'pt',format:'letter'}); var x=54,y=64;
+  doc.setFont('helvetica','bold');doc.setFontSize(17);doc.setTextColor('#1d3b2a');
+  doc.text('Environmental Constraint Screening',x,y); y+=20;
+  doc.setFont('helvetica','normal');doc.setFontSize(10);doc.setTextColor('#666');
+  doc.text('Site: '+R.name+'   |   '+new Date().toISOString().slice(0,10)+'   |   WOTUS: '+r.scenario,x,y); y+=26;
+  var c=RATING[r.rating];
+  doc.setFont('helvetica','bold');doc.setFontSize(30);doc.setTextColor(c);doc.text(r.composite.toFixed(1)+' / 100',x,y);
+  doc.setFontSize(12);doc.setFillColor(c);doc.setTextColor('#fff');doc.roundedRect(x+150,y-15,90,20,3,3,'F');
+  doc.text(r.rating,x+160,y); y+=30;
+  doc.setTextColor('#20241f');doc.setFontSize(12);doc.setFont('helvetica','bold');doc.text('Constraint dimensions',x,y);y+=16;
+  doc.setFont('helvetica','normal');doc.setFontSize(10.5);
+  DIMS.forEach(function(d){doc.text(d[1],x,y);doc.text(r.dims[d[0]].toFixed(1),x+330,y,{align:'right'});y+=15;});
+  y+=8;doc.setFont('helvetica','bold');doc.setFontSize(12);doc.text('Site metrics',x,y);y+=16;
+  doc.setFont('helvetica','normal');doc.setFontSize(10.5);
+  var mm=[['Boundary area',m.bAreaHa.toFixed(1)+' ha'],
+   ['Playas in boundary',m.count+'  ('+m.playaPct.toFixed(1)+'% of site)'],
+   ['Large playas (>=4 ha)',String(m.large)],
+   ['Playa avoidance footprint',m.bufferPct.toFixed(1)+'% of site'],
+   ['Playa cluster intensity',m.clusterIntensity.toFixed(0)+'/100  ('+m.clusterPct.toFixed(1)+'% of site)']];
+  mm.forEach(function(p){doc.text(p[0],x,y);doc.text(p[1],x+330,y,{align:'right'});y+=15;});
+  var fl=DIMS.filter(function(d){return r.dims[d[0]]>=50;});
+  y+=8;doc.setFont('helvetica','bold');doc.setFontSize(12);doc.text('Flags & recommended actions',x,y);y+=16;
+  doc.setFont('helvetica','normal');doc.setFontSize(10);
+  if(fl.length){fl.forEach(function(d){var lines=doc.splitTextToSize('• '+d[1]+': '+ACTIONS[d[0]],460);doc.text(lines,x,y);y+=lines.length*13;});}
+  else{doc.text('No dimension exceeded the flag threshold.',x,y);y+=14;}
+  y+=10;doc.setFontSize(8);doc.setTextColor('#888');
+  doc.text(doc.splitTextToSize('Screening tool only — not a jurisdictional determination or wetland delineation. Playa-driven score; NWI and critical-habitat refinements are handled by the Python tool. See METHODOLOGY.md for sources.',460),x,y);
+  doc.save('report_'+R.name.replace(/[^a-zA-Z0-9]/g,'_')+'.pdf');
+ };
+}
+</script></body></html>
